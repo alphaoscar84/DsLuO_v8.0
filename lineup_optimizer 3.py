@@ -5,7 +5,7 @@ import time
 import os
 
 # === Settings ===
-file_path = "/home/AlphaOscar/LCv6/players_CgGdrAf0.csv"  # Update path if needed
+file_path = "players_Cs3drziI.csv"  # Update path if needed
 SALARY_CAP = 100000
 TOP_N_TEAMS = 100
 PROGRESS_UPDATE_INTERVAL = 5000  # Progress print frequency
