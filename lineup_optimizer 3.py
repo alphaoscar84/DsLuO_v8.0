@@ -5,7 +5,7 @@ import time
 import os
 
 # === Settings ===
-file_path = "players_Cs3drziI.csv"  # Update path if needed
+file_path = "https://github.com/alphaoscar84/Lineup-Cruncher-v6.0/blob/main/players_Cs3drziI.csv"  # Update path if needed
 SALARY_CAP = 100000
 TOP_N_TEAMS = 100
 PROGRESS_UPDATE_INTERVAL = 5000  # Progress print frequency
@@ -101,7 +101,7 @@ for idx, (score, avg, salary, ids) in enumerate(top_teams, 1):
     })
 
 output_df = pd.DataFrame(rows)
-output_path = os.path.join(os.getcwd(), '/home/AlphaOscar/LCv6/top_teams_nth_car.csv')
+output_path = os.path.join(os.getcwd(), 'top_teams_bne_gee.csv')
 output_df.to_csv(output_path, index=False)
 
 # Completion time
