@@ -1,5 +1,4 @@
 import pandas as pd
-from pathlib import Path
 import math
 import traceback
 import time
@@ -7,7 +6,6 @@ import csv
 import random
 import io
 import streamlit as st
-
 import pulp
 
 
@@ -36,7 +34,16 @@ DEFAULTS = {
     "SOLVER_TIME_LIMIT": None,
     "PLAYING_STATUS_REQUIRED_TEXT": "IN TEAM TO PLAY",
     "FALLBACK_PROJECTION": 41.22,
+    "DRAFTSTARS_START_ROW": 2,
+    "DRAFTSTARS_START_COL": 4,
 }
+
+DRAFTSTARS_POSITION_ORDER = [
+    "FWD1", "FWD2",
+    "MID1", "MID2", "MID3", "MID4",
+    "DEF1", "DEF2",
+    "RK1"
+]
 
 TEAM_ALIASES = {
     "adelaide": "Crows",
@@ -148,14 +155,12 @@ def rotated_position_order_for_lineup(lineup_idx, position_start_cycle):
 def build_tiebreak_bonus_map(df, lineup_idx, random_seed, position_start_cycle):
     rng = random.Random(random_seed + lineup_idx)
     pos_order = rotated_position_order_for_lineup(lineup_idx, position_start_cycle)
-
     pos_weight = {pos: len(pos_order) - i for i, pos in enumerate(pos_order)}
 
     bonuses = {}
     for pos in pos_order:
         pos_rows = df.loc[df["Position"] == pos, "RowID"].tolist()
         rng.shuffle(pos_rows)
-
         for j, rid in enumerate(pos_rows):
             bonuses[rid] = pos_weight[pos] * 1_000_000 + (len(pos_rows) - j)
 
@@ -179,6 +184,109 @@ def load_inputs(players_file_obj, merged_file_obj):
         raise ValueError("Merged averages file must be CSV or Excel.")
 
     return players, merged
+
+
+# =========================================================
+# DRAFTSTARS HELPERS
+# =========================================================
+def load_draftstars_name_id_lookup_from_upload(draftstars_file_obj):
+    raw_bytes = draftstars_file_obj.getvalue()
+
+    for skip in range(0, 20):
+        try:
+            test_df = pd.read_csv(io.BytesIO(raw_bytes), skiprows=skip)
+
+            name_col = None
+            id_col = None
+
+            for c in test_df.columns:
+                cl = str(c).strip().lower()
+                if cl == "name":
+                    name_col = c
+                elif cl in {"id", "player id", "playerid"}:
+                    id_col = c
+
+            if name_col is not None and id_col is not None:
+                lookup_df = test_df[[name_col, id_col]].copy()
+                lookup_df[name_col] = lookup_df[name_col].astype(str).str.strip()
+                lookup_df[id_col] = lookup_df[id_col].astype(str).str.strip()
+
+                lookup_df = lookup_df[
+                    (lookup_df[name_col] != "") &
+                    (lookup_df[id_col] != "") &
+                    (lookup_df[name_col].str.lower() != "nan") &
+                    (lookup_df[id_col].str.lower() != "nan")
+                ].copy()
+
+                return dict(zip(lookup_df[name_col], lookup_df[id_col])), skip, raw_bytes
+
+        except Exception:
+            continue
+
+    return None, None, raw_bytes
+
+
+def build_updated_draftstars_csv(draftstars_file_obj, lineups_export, start_row, start_col):
+    name_to_id, detected_skiprows, raw_bytes = load_draftstars_name_id_lookup_from_upload(draftstars_file_obj)
+
+    if not name_to_id:
+        raise ValueError("Could not detect Draftstars Name/ID columns automatically.")
+
+    all_rows = list(csv.reader(io.StringIO(raw_bytes.decode("utf-8"))))
+
+    missing_lineup_cols = [c for c in DRAFTSTARS_POSITION_ORDER if c not in lineups_export.columns]
+    if missing_lineup_cols:
+        raise ValueError(f"Expected lineup columns not found: {missing_lineup_cols}")
+
+    inserted_count = 0
+    missing_id_names = []
+    truncated = False
+
+    for lineup_idx, (_, lineup_row) in enumerate(lineups_export.iterrows()):
+        row_index = start_row + lineup_idx
+
+        if row_index >= len(all_rows):
+            truncated = True
+            break
+
+        player_cells = []
+
+        for col in DRAFTSTARS_POSITION_ORDER:
+            raw_name = lineup_row.get(col, "")
+            if pd.isna(raw_name) or str(raw_name).strip() == "":
+                player_cells.append("")
+                continue
+
+            name = str(raw_name).strip()
+            player_id = name_to_id.get(name)
+
+            if player_id:
+                player_cells.append(f"{name} ({player_id})")
+            else:
+                player_cells.append(name)
+                missing_id_names.append(name)
+
+        needed_len = start_col + len(player_cells)
+        if len(all_rows[row_index]) < needed_len:
+            all_rows[row_index].extend([""] * (needed_len - len(all_rows[row_index])))
+
+        for i, val in enumerate(player_cells):
+            all_rows[row_index][start_col + i] = val
+
+        inserted_count += 1
+
+    out = io.StringIO()
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL)
+    writer.writerows(all_rows)
+
+    meta = {
+        "detected_skiprows": detected_skiprows,
+        "inserted_count": inserted_count,
+        "missing_id_names": sorted(set(missing_id_names)),
+        "truncated": truncated,
+    }
+
+    return out.getvalue().encode("utf-8"), meta
 
 
 # =========================================================
@@ -224,7 +332,6 @@ def prepare_players_df(players, required_status_text):
     df["Playing Status"] = df["Playing Status"].astype(str).str.strip()
     df["EligiblePositions"] = df["PositionRaw"].map(parse_positions)
 
-    # Keep only players whose Playing Status contains the required text
     df = df[
         df["Playing Status"].str.contains(required_status_text, case=False, na=False)
     ].copy()
@@ -235,23 +342,9 @@ def prepare_players_df(players, required_status_text):
 
 def prepare_merged_df(merged):
     player_col = find_first_existing_column(merged, ["Player", "Name"])
-
-    team_col = find_first_existing_column(
-        merged,
-        ["Team", "Team_2026", "Team_2025"],
-        required=False
-    )
-
-    avg_col = find_first_existing_column(
-        merged,
-        ["Average", "NewAverage", "MergedAverage"],
-    )
-
-    games_col = find_first_existing_column(
-        merged,
-        ["TotalGames", "Total_Games", "Total Games", "Games", "Gm"],
-        required=False
-    )
+    team_col = find_first_existing_column(merged, ["Team", "Team_2026", "Team_2025"], required=False)
+    avg_col = find_first_existing_column(merged, ["Average", "NewAverage", "MergedAverage"])
+    games_col = find_first_existing_column(merged, ["TotalGames", "Total_Games", "Total Games", "Games", "Gm"], required=False)
 
     df = merged.copy()
     rename_map = {
@@ -291,7 +384,6 @@ def match_players(players_df, merged_df, fallback_projection):
     )
 
     out["MatchMethod"] = out["MergedAverage"].notna().map(lambda x: "full-name" if x else "")
-
     unmatched_mask = out["MergedAverage"].isna()
 
     if unmatched_mask.any():
@@ -474,6 +566,8 @@ def solve_lineups_exact(expanded, settings):
 
     solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=settings["SOLVER_TIME_LIMIT"])
 
+    progress = st.progress(0.0, text="Solving lineups...")
+
     for lineup_idx in range(1, settings["LINEUP_COUNT"] + 1):
         prob = pulp.LpProblem(f"Lineup_ProjectedAverage_{lineup_idx}", pulp.LpMaximize)
         x = {rid: pulp.LpVariable(f"x_{rid}", cat="Binary") for rid in row_ids}
@@ -562,6 +656,8 @@ def solve_lineups_exact(expanded, settings):
         status = prob.solve(solver)
         status_name = pulp.LpStatus[status]
 
+        progress.progress(min(lineup_idx / settings["LINEUP_COUNT"], 1.0), text=f"Solving lineup {lineup_idx} of {settings['LINEUP_COUNT']}")
+
         if status_name != "Optimal":
             break
 
@@ -596,6 +692,7 @@ def solve_lineups_exact(expanded, settings):
             "forced_top3_bucket": forced_bucket if forced_bucket is not None else "",
         })
 
+    progress.empty()
     return solved_lineups
 
 
@@ -604,17 +701,18 @@ def solve_lineups_exact(expanded, settings):
 # =========================================================
 st.set_page_config(page_title="Enhanced Lineup Generator", layout="wide")
 st.title("Enhanced Lineup Uniqueness Generator")
-
-st.caption("Upload your players CSV and merged averages file, then generate lineups in-browser.")
+st.caption("Upload your players CSV, merged averages file, and optionally a Draftstars batch-edit CSV.")
 
 with st.sidebar:
     st.header("Inputs")
     players_file = st.file_uploader("Players CSV", type=["csv"])
     merged_file = st.file_uploader("Merged averages file", type=["csv", "xlsx", "xls"])
+    draftstars_file = st.file_uploader("Draftstars CSV (optional)", type=["csv"])
 
     st.header("Outputs")
     output_ranked_players = st.text_input("Ranked players filename", value="r4_col_bne_player_rankings.csv")
     output_lineups = st.text_input("Lineups filename", value="R4_col_bne4_6e.csv")
+    output_draftstars = st.text_input("Updated Draftstars filename", value="Draftstars_UPDATED.csv")
 
     st.header("Core settings")
     salary_cap = st.number_input("Salary cap", value=DEFAULTS["SALARY_CAP"], step=1000)
@@ -720,6 +818,32 @@ if run_button:
             file_name=output_lineups,
             mime="text/csv"
         )
+
+        if draftstars_file is not None:
+            st.info("Building updated Draftstars CSV...")
+            updated_draftstars_bytes, ds_meta = build_updated_draftstars_csv(
+                draftstars_file_obj=draftstars_file,
+                lineups_export=lineups_export,
+                start_row=DEFAULTS["DRAFTSTARS_START_ROW"],
+                start_col=DEFAULTS["DRAFTSTARS_START_COL"],
+            )
+
+            st.download_button(
+                "Download updated Draftstars CSV",
+                data=updated_draftstars_bytes,
+                file_name=output_draftstars,
+                mime="text/csv"
+            )
+
+            st.write(f"Draftstars Name/ID header detected using skiprows = {ds_meta['detected_skiprows']}")
+            st.write(f"Draftstars lineups inserted: {ds_meta['inserted_count']:,}")
+
+            if ds_meta["truncated"]:
+                st.warning("Draftstars file ran out of rows before all lineups could be inserted.")
+
+            if ds_meta["missing_id_names"]:
+                st.warning(f"No Draftstars ID found for {len(ds_meta['missing_id_names'])} player(s).")
+                st.dataframe(pd.DataFrame({"Missing Draftstars IDs": ds_meta["missing_id_names"]}), use_container_width=True)
 
     except Exception as e:
         st.error(f"ERROR: {e}")
